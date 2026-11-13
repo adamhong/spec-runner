@@ -1,6 +1,6 @@
 {
   "name": "spec-runner",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run a queue of written specs to PRs: one fresh agent per commit-sized task, an independent completeness gate per spec, failures checked against the base branch so pre-existing breakage never becomes the spec's work.",
   "author": { "name": "Adam Hong" },
   "license": "MIT"

@@ -1,12 +1,13 @@
 export const meta = {
   name: 'run-specs',
   description: 'Implement ready specs one commit-sized task at a time; each spec gets a PR only after an independent completeness gate passes',
-  whenToUse: 'Invoked by /spec-runner:run-specs, which reads the repo\'s .claude/spec-runner.json and passes it as args.config. Requires args {config, ids?, review?, maxSpecs?, fixRounds?, defaultModel?}. Run from the base branch with a clean working tree.',
+  whenToUse: 'Invoked by /spec-runner:run-specs, which reads the repo\'s .claude/spec-runner.json, prepares the worktree, and passes everything as args. Requires args {config, base?, baseRef?, worktree?, ids?, review?, maxSpecs?, fixRounds?, defaultModel?, readiness?}.',
   phases: [
-    { title: 'Plan', detail: 'discover ready specs, read model + dependency frontmatter, capture base branch' },
+    { title: 'Plan', detail: 'discover ready specs, read model + dependency frontmatter' },
+    { title: 'Ready', detail: 'read-only check of each spec — gaps, contradictions, missing verification; unready specs are skipped with reasons' },
     { title: 'Claim', detail: 'branch off the base (or the parent spec\'s branch), move spec to in-progress, decompose into tasks if missing, detect resume' },
-    { title: 'Tasks', detail: 'one fresh agent per task — implement, compile-check (no tests), commit with Spec-Task trailer, check off' },
-    { title: 'Gate', detail: 'independent agent audits task commits + verification + acceptance criteria; failures baselined against the base branch; bounded fix rounds' },
+    { title: 'Tasks', detail: 'one fresh agent per task — implement, compile-check (no tests), commit with Spec-Task trailer — then a light review of that commit against its task' },
+    { title: 'Gate', detail: 'independent agent audits task commits + verification + acceptance criteria; failures baselined against the base branch; escalating fix rounds' },
     { title: 'Capture', detail: 'repo-defined screenshots / walkthroughs — advisory, skipped when the repo defines none' },
     { title: 'Complete', detail: 'move spec to done, push, open PR — only after the gate passes' },
     { title: 'Review', detail: 'fresh agent runs /code-review high --comment on each PR (advisory)' },
@@ -17,7 +18,11 @@ export const meta = {
 // args.config is the repo's .claude/spec-runner.json, with every `prompts.*`
 // path already replaced by that file's text (the command does this — workflow
 // scripts cannot read files). See README.md for the full reference.
-// Other args: ids (spec ids to run), review, maxSpecs, fixRounds, defaultModel.
+//
+// args.worktree: absolute path of the checkout this run works in (the command
+// creates it). Absent = work in the current checkout ("--here").
+// args.base: the branch PRs target. args.baseRef: the git ref new branches
+// start from and failures are compared against (e.g. origin/develop).
 // `args` may arrive as a JSON string depending on the caller; accept both.
 const ARGS = typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch (e) { return {} } })() : (args || {})
 const opts = Array.isArray(ARGS) ? { ids: ARGS } : ARGS
@@ -52,13 +57,24 @@ const ACCEPTANCE = C.acceptance || 'each criterion in the spec\'s "## Acceptance
 const GATE_SETUP = C.gateSetup || ''
 const P = C.prompts || {}
 const MODEL = C.model || {}
+const ESCALATE = { fromRound: 3, model: 'opus', ...(C.fixEscalation || {}) }
 
 const ID_FILTER = opts.ids && opts.ids.length ? opts.ids : null
 const RUN_REVIEW = opts.review ?? (C.review !== false)
+const RUN_READINESS = opts.readiness ?? (C.readinessCheck !== false)
+const RUN_TASK_REVIEW = opts.taskReview ?? (C.taskReview !== false)
 const DEFAULT_MODEL = opts.defaultModel || MODEL.default || 'sonnet'
 const MAX_SPECS = opts.maxSpecs || 0
-const FIX_ROUNDS = opts.fixRounds ?? C.fixRounds ?? 2
+const FIX_ROUNDS = opts.fixRounds ?? C.fixRounds ?? 4
 const GATE_ATTEMPTS = opts.gateAttempts ?? 3
+const WORKTREE = opts.worktree || ''
+
+// Every agent works in the run's worktree when there is one. Prepended to
+// every prompt, because each agent starts fresh and knows nothing else.
+const WHERE = WORKTREE
+  ? `WORKING DIRECTORY: this run builds in its own git worktree at ${WORKTREE}. cd there before your first command and run every command from there; read and edit files only under that path. Never touch the user's main checkout — they may be working in it right now.\n\n`
+  : ''
+const ask = (prompt, o) => agent(WHERE + prompt, o)
 
 // Replace {name} placeholders whose name is a known variable; leave every
 // other brace alone, so shell snippets in repo prompts survive untouched.
@@ -122,7 +138,7 @@ const idClause = ID_FILTER
   ? `Only include specs whose id is one of: ${ID_FILTER.join(', ')} (match loosely — "87" means the spec whose id is 87 in whatever padding the repo uses). If a requested id has no file, still return the rest.`
   : 'Include every spec there.'
 
-const plan = await agent(
+const plan = await ask(
   `You are preparing a batch spec run. Do NOT modify anything — read only.
 1. Run: git rev-parse --abbrev-ref HEAD  → this is baseBranch.
 2. List the specs in ${S.ready}/. What counts as a spec: ${S.match}.${S.folders ? ` A spec is EITHER ${S.ready}/<name>.md OR a folder ${S.ready}/<name>/spec.md — globbing only *.md silently skips folder specs. For a folder spec, \`path\` is its spec.md and \`filename\` is the folder name.` : ''} The id of each spec is ${S.id}. ${idClause}
@@ -134,10 +150,14 @@ Return the structured result.`,
   { phase: 'Plan', label: 'plan:discover', schema: PLAN_SCHEMA },
 )
 
-if (C.baseBranch && plan.baseBranch !== C.baseBranch) {
+// In a worktree the command decides the base (the worktree sits on a detached
+// origin/<base>). In place, the current branch is the base and must match.
+if (!WORKTREE && C.baseBranch && plan.baseBranch !== C.baseBranch) {
   log(`Run from ${C.baseBranch} — the working tree is on ${plan.baseBranch}. Nothing was changed.`)
   return { error: `wrong base branch: on ${plan.baseBranch}, config says ${C.baseBranch}` }
 }
+const startBase = opts.base || C.baseBranch || plan.baseBranch
+const startRef = opts.baseRef || startBase
 
 let specs = plan.specs || []
 if (MAX_SPECS > 0 && specs.length > MAX_SPECS) {
@@ -147,10 +167,56 @@ if (MAX_SPECS > 0 && specs.length > MAX_SPECS) {
 
 if (specs.length === 0) {
   log(`No specs found in ${S.ready}/ — nothing to do.`)
-  return { baseBranch: plan.baseBranch, processed: [], note: 'no specs' }
+  return { baseBranch: startBase, processed: [], note: 'no specs' }
 }
 
-log(`Planning ${specs.length} spec(s) off ${plan.baseBranch} (${STACKING} stacking): ${specs.map(s => s.id).join(', ')}`)
+log(`Planning ${specs.length} spec(s) off ${startRef}${WORKTREE ? ` in worktree ${WORKTREE}` : ''} (${STACKING} stacking): ${specs.map(s => s.id).join(', ')}`)
+
+// ── Phase 2: Ready — is each spec buildable as written? ──────
+// A thin or contradictory spec is the most expensive failure there is: it
+// spends every task and a gate before anyone finds out. These checks are
+// read-only, so they run in parallel; a barrier is right here because the
+// run needs the full verdict list before it decides what to claim.
+const READY_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ready: { type: 'boolean', description: 'false only for a problem that would make the work ambiguous or the gate impossible to pass' },
+    problems: { type: 'array', items: { type: 'string' }, description: 'each blocking problem, concrete enough for the author to fix in one edit' },
+    warnings: { type: 'array', items: { type: 'string' }, description: 'worth fixing, but the spec can still be built' },
+  },
+  required: ['ready', 'problems', 'warnings'],
+}
+
+const notReady = {} // spec id → problems
+if (RUN_READINESS) {
+  phase('Ready')
+  const verdicts = await parallel(specs.map(spec => () => ask(
+    `Check whether spec ${spec.id} (${spec.path}) is ready to be built by agents with no one to ask. Read it, ${TEMPLATE}, and ${PROCESS}. Do NOT modify anything — read only.
+
+It is NOT ready (ready=false) only if one of these holds — list each as a problem, concrete enough to fix in one edit:
+- An agent would have to guess: a requirement has two reasonable readings that lead to different code, or says TBD / TODO / "decide later" / an open question about behavior.
+- The spec contradicts itself, or contradicts code it says already exists (check the files it names).
+- There is no way to verify it: nothing in ${VERIFICATION.replace(/^every command in /, '')} could be run, and ${ACCEPTANCE.replace(/^each criterion in /, '')} is missing or untestable.
+- It has a "## Tasks" section that leaves out work the spec describes, or a task depends on a later one.
+
+Anything else — style, wording, a missing nice-to-have, a criterion that needs a manual check — is a warning, not a problem. Do not hold a spec back for polish.`,
+    { phase: 'Ready', label: `ready:${spec.id}`, schema: READY_SCHEMA },
+  )))
+  specs.forEach((spec, idx) => {
+    const v = verdicts[idx]
+    if (!v) {
+      log(`[${spec.id}] readiness check errored — building it anyway; the gate still applies`)
+      return
+    }
+    if (!v.ready) {
+      notReady[spec.id] = v.problems
+      log(`[${spec.id}] NOT READY — ${v.problems.join(' | ')}`)
+    } else if (v.warnings.length) {
+      log(`[${spec.id}] ready, with warnings: ${v.warnings.join(' | ')}`)
+    }
+  })
+}
 
 // ── Schemas for the per-spec stages ──────────────────────────
 const CLAIM_SCHEMA = {
@@ -189,6 +255,16 @@ const TASK_SCHEMA = {
     summary: { type: 'string', description: 'one or two sentences on what was done, or what failed' },
   },
   required: ['committed', 'sha', 'summary'],
+}
+
+const TASK_REVIEW_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ok: { type: 'boolean', description: 'true if the commit does what the task asks, within its scope' },
+    problems: { type: 'array', items: { type: 'string' }, description: 'each concrete problem: what is wrong, where (file:line), what the task needed instead' },
+  },
+  required: ['ok', 'problems'],
 }
 
 const GATE_SCHEMA = {
@@ -255,7 +331,7 @@ const COMPLETE_SCHEMA = {
   required: ['prNumber', 'pushed', 'summary'],
 }
 
-// ── Phases 2–7: sequential, one spec at a time ───────────────
+// ── Per spec, one at a time ──────────────────────────────────
 // SEQUENTIAL ON PURPOSE: every agent mutates the same working tree and
 // touches git, so this must NOT be parallel()/pipeline().
 //
@@ -267,11 +343,10 @@ const COMPLETE_SCHEMA = {
 // stacking "chain": every spec branches off the previous one, and the first
 // failure stops the run (nothing is stacked on an incomplete base).
 const processed = []
-const startBase = plan.baseBranch
 const runIds = new Set(specs.map(s => s.id))
 const orderOf = new Map(specs.map((s, idx) => [s.id, idx]))
 const branchById = {} // spec id → branch, set only once a spec lands clean
-let chainBase = startBase
+let chain = { base: startBase, ref: startRef }
 let chainBroken = false
 
 for (let i = 0; i < specs.length; i++) {
@@ -282,8 +357,20 @@ for (let i = 0; i < specs.length; i++) {
   processed.push(record)
   const stop = () => { if (STACKING === 'chain') chainBroken = true }
 
-  // ── Resolve the base branch ────────────────────────────────
+  if (notReady[spec.id]) {
+    record.skipped = true
+    record.notReady = notReady[spec.id]
+    record.skipReason = 'spec not ready'
+    stop()
+    continue
+  }
+
+  // ── Resolve the base ───────────────────────────────────────
+  // base = the branch the PR targets; baseRef = the git ref to branch from
+  // and compare against. They differ only for the start base in a worktree
+  // (develop vs origin/develop); a parent spec's branch is local either way.
   let base
+  let baseRef
   let parentDep = null
   if (STACKING === 'chain') {
     if (chainBroken) {
@@ -292,14 +379,15 @@ for (let i = 0; i < specs.length; i++) {
       log(`[${spec.id}] skipped — the chain stopped at an earlier spec`)
       continue
     }
-    base = chainBase
+    base = chain.base
+    baseRef = chain.ref
   } else {
     // Only deps that are part of THIS run matter: a dep already done is
     // merged into the base branch.
     const inRunDeps = (spec.deps || []).filter(d => runIds.has(d) && d !== spec.id)
     const unmetDeps = inRunDeps.filter(d => !branchById[d])
     if (unmetDeps.length) {
-      log(`[${spec.id}] skipped — in-run dependency not available (blocked/failed or ordered later): ${unmetDeps.join(', ')}`)
+      log(`[${spec.id}] skipped — in-run dependency not available (not ready, blocked, failed, or ordered later): ${unmetDeps.join(', ')}`)
       record.skipped = true
       record.skipReason = `unmet in-run dependencies: ${unmetDeps.join(', ')}`
       continue
@@ -308,27 +396,27 @@ for (let i = 0; i < specs.length; i++) {
     // contains any earlier chained deps.
     parentDep = inRunDeps.length ? inRunDeps.reduce((a, b) => (orderOf.get(b) > orderOf.get(a) ? b : a)) : null
     base = parentDep ? branchById[parentDep] : startBase
+    baseRef = parentDep ? branchById[parentDep] : startRef
   }
   record.base = base
   const vars = {
-    id: spec.id, filename: spec.filename, slug: spec.slug, branch, base,
+    id: spec.id, filename: spec.filename, slug: spec.slug, branch, base: baseRef, prBase: base,
     ready: S.ready, inProgress: S.inProgress, done: S.done,
   }
 
   // ── Claim + Decompose ──────────────────────────────────────
-  log(`[${spec.id}] claiming on ${branch} (base: ${base}${parentDep ? ` ← dep ${parentDep}` : ''}) — ${i + 1}/${specs.length}`)
+  log(`[${spec.id}] claiming on ${branch} (base: ${baseRef}${parentDep ? ` ← dep ${parentDep}` : ''}) — ${i + 1}/${specs.length}`)
   let claim
   try {
-    claim = await agent(
+    claim = await ask(
       `You are claiming spec ${spec.id} for implementation. Follow ${PROCESS} for starting a spec.
 
 If branch ${branch} does NOT exist yet:
-1. git checkout ${base}
-2. git checkout -b ${branch}
-3. Move the spec to in-progress:
+1. git checkout -b ${branch} ${baseRef}
+2. Move the spec to in-progress:
 ${moveSteps(S.ready, S.inProgress, spec)}
    Report the spec markdown's new path in specPath.
-4. Commit: chore: start spec ${spec.id} — [title from the spec]
+3. Commit: chore: start spec ${spec.id} — [title from the spec]
 
 If branch ${branch} DOES exist (a previous run was interrupted): check it out, do NOT recreate it, and treat this as a resume. The spec should already be under ${S.inProgress}/.
 
@@ -372,7 +460,7 @@ Finally, report every task in order. A task counts as done=true ONLY if its chec
     let result = null
     for (let attempt = 1; attempt <= 2 && !result?.committed; attempt++) {
       try {
-        result = await agent(
+        result = await ask(
           `You are implementing exactly ONE task of spec ${spec.id}. The spec file is at ${claim.specPath} on branch ${branch} (verify with git rev-parse --abbrev-ref HEAD; check it out if needed).
 
 Your task: **${task.id} — ${task.title}**
@@ -393,16 +481,60 @@ ${attempt > 1 ? 'NOTE: a previous attempt failed — check git status for leftov
         log(`[${spec.id}] ${task.id} attempt ${attempt} errored: ${e?.message || e}`)
       }
     }
-    record.tasks.push({ id: task.id, ...(result || { committed: false, sha: '', summary: 'agent error' }) })
+    const taskRecord = { id: task.id, ...(result || { committed: false, sha: '', summary: 'agent error' }) }
+    record.tasks.push(taskRecord)
     if (!result?.committed) {
       taskFailed = task.id
       log(`[${spec.id}] ${task.id} failed twice — sending spec to the gate/blocked path`)
       break
     }
     log(`[${spec.id}] ${task.id} committed (${String(result.sha).slice(0, 8)})`)
+
+    // ── Light review of this one commit ──────────────────────
+    // Catches a wrong turn at the task that took it, not at the gate after
+    // the last task. No tests — reading only. One fix attempt; the gate is
+    // still the judge, so a review that can't be satisfied doesn't block.
+    if (RUN_TASK_REVIEW) {
+      let review = null
+      try {
+        review = await ask(
+          `Review ONE commit against the task it claims to implement. You did not write it. Do NOT run tests, do NOT modify anything — read only.
+
+Spec ${spec.id}, file ${claim.specPath}, branch ${branch}. Task: **${task.id} — ${task.title}**. Commit: ${result.sha} (\`git show ${result.sha}\`).
+
+Check only:
+- Does the commit do what the task asks, as the spec describes it? Anything missing or wrong?
+- Did it stay in scope: no work from later tasks, no unrelated edits?
+- Anything that plainly won't work: a call to something that doesn't exist, a wrong field or route name, an obviously broken condition.
+
+ok=false only for problems a fix should address now. Do not flag style, naming taste or things a later task will clearly cover.`,
+          { phase: 'Tasks', label: `taskreview:${spec.id}.${task.id}`, schema: TASK_REVIEW_SCHEMA },
+        )
+      } catch (e) {
+        log(`[${spec.id}] ${task.id} review errored — continuing. ${e?.message || e}`)
+      }
+      taskRecord.review = review
+      if (review && !review.ok && review.problems.length) {
+        log(`[${spec.id}] ${task.id} review found ${review.problems.length} problem(s) — one fix attempt`)
+        try {
+          await ask(
+            `A reviewer found problems in task ${task.id} of spec ${spec.id} (commit ${result.sha}, branch ${branch}, spec file ${claim.specPath}). Fix exactly these and nothing else:
+
+${review.problems.map(p => `- ${p}`).join('\n')}
+
+If a problem is wrong (the code is actually fine), leave it and say why in your final message. Do NOT run tests; check that what you touched compiles cleanly: ${COMPILE_CHECK}. Commit the fix as a new commit (do not amend or rewrite history) whose message ends with the trailer line:
+
+Spec-Task: ${spec.id}.${task.id}`,
+            { phase: 'Tasks', label: `taskfix:${spec.id}.${task.id}`, model },
+          )
+        } catch (e) {
+          log(`[${spec.id}] ${task.id} review fix errored — the gate will catch what's left. ${e?.message || e}`)
+        }
+      }
+    }
   }
 
-  // ── Completeness gate + bounded fix rounds ─────────────────
+  // ── Completeness gate + escalating fix rounds ──────────────
   // A FRESH agent with no implementation context. It judges evidence
   // (commits, checkboxes, passing commands), not intentions.
   let gate = null
@@ -415,12 +547,12 @@ ${attempt > 1 ? 'NOTE: a previous attempt failed — check git status for leftov
     gate = null
     for (let attempt = 1; attempt <= GATE_ATTEMPTS && !gate; attempt++) {
       try {
-        gate = await agent(
+        gate = await ask(
           `You are the completeness gate for spec ${spec.id}. You did not write this code — audit it skeptically on branch ${branch}. The spec file is at ${claim.specPath}.
 ${GATE_SETUP ? `\nSetup first: ${GATE_SETUP}\n` : ''}
 1. Tasks: list every task in the "## Tasks" section. Report any still [ ] as uncheckedTasks. For each [x] task, confirm a commit exists: git log --grep '^Spec-Task: ${spec.id}\\.<id>$' — report checked tasks with no commit as missingCommits.
 2. Verification: run ${VERIFICATION}. Report anything that fails in failedVerification (include the failing output's gist in notes).
-${preExisting.length ? `   ALREADY PROVEN RED ON ${base} — do NOT re-run these, and do NOT report them in failedVerification. A baseline run has confirmed they are someone else's problem:\n${preExisting.map(c => `     - ${c}`).join('\n')}\n` : ''}   For anything that does fail, ask whether this branch could plausibly have caused it: does the failing test live in a file \`git diff --name-only ${base}...HEAD\` lists? Is it a dependency advisory, a missing service, an environment problem? If it looks like it was already broken, still report it in failedVerification but ALSO list it in suspectedPreExisting. Do not fix it — a baseline run decides it, not you.
+${preExisting.length ? `   ALREADY PROVEN RED ON ${baseRef} — do NOT re-run these, and do NOT report them in failedVerification. A baseline run has confirmed they are someone else's problem:\n${preExisting.map(c => `     - ${c}`).join('\n')}\n` : ''}   For anything that does fail, ask whether this branch could plausibly have caused it: does the failing test live in a file \`git diff --name-only ${baseRef}...HEAD\` lists? Is it a dependency advisory, a missing service, an environment problem? If it looks like it was already broken, still report it in failedVerification but ALSO list it in suspectedPreExisting. Do not fix it — a baseline run decides it, not you.
 3. Acceptance criteria: walk ${ACCEPTANCE}. Mark satisfied ones [x] in the spec file (append "(manually verified)" where programmatic verification is impossible but you confirmed it by inspection). Leave unsatisfied ones [ ] and report them in uncheckedCriteria. If you changed the spec file, commit: chore: mark acceptance criteria for spec ${spec.id}
 
 complete=true ONLY if all three checks pass clean. Do not give the benefit of the doubt — an unverifiable claim is a failed check.`,
@@ -446,20 +578,20 @@ complete=true ONLY if all three checks pass clean. Do not give the benefit of th
     const failed = gate.failedVerification.filter(c => !preExisting.includes(c))
     if (failed.length && !baselineRan) {
       baselineRan = true
-      log(`[${spec.id}] ${failed.length} command(s) failing — checking whether ${base} was already red`)
+      log(`[${spec.id}] ${failed.length} command(s) failing — checking whether ${baseRef} was already red`)
       try {
-        const baseline = await agent(
-          `Spec ${spec.id}'s completeness gate reported failing verification on branch ${branch}. Before anyone "fixes" it, find out whether it was ALREADY failing on ${base}. Do NOT fix anything and do NOT commit anything — this is a measurement.
+        const baseline = await ask(
+          `Spec ${spec.id}'s completeness gate reported failing verification on branch ${branch}. Before anyone "fixes" it, find out whether it was ALREADY failing on ${baseRef}. Do NOT fix anything and do NOT commit anything — this is a measurement.
 
 Commands to test, verbatim (run each the way the spec's verification says to — the spec is at ${claim.specPath}):
 ${failed.map(c => `  - ${c}`).join('\n')}
 
 Procedure:
 1. \`git status --porcelain\` MUST be empty. If it is not, stop: report ran=false with the reason, put nothing in alreadyFailing. Never stash or discard someone's work to take a measurement.
-2. Note the current branch, then \`git checkout ${base}\`.
+2. \`git checkout --detach ${baseRef}\`.
 3. Run each command above and record its exit code. Build artifacts may need rebuilding on the way in and back out; that is expected.
 4. \`git checkout ${branch}\` — even if a command blew up — and confirm with \`git rev-parse --abbrev-ref HEAD\`. Leaving the tree on the wrong branch corrupts every later phase.
-5. A command that fails on ${base} too goes in alreadyFailing, verbatim as given above. One that passes on ${base} goes in newlyFailing.
+5. A command that fails on ${baseRef} too goes in alreadyFailing, verbatim as given above. One that passes on ${baseRef} goes in newlyFailing.
 
 In notes, say briefly what each failure actually was, so a human reading the PR knows what is already broken on ${base}.`,
           { phase: 'Gate', label: `baseline:${spec.id}`, schema: BASELINE_SCHEMA },
@@ -468,7 +600,7 @@ In notes, say briefly what each failure actually was, so a human reading the PR 
           for (const c of baseline.alreadyFailing || []) if (!preExisting.includes(c)) preExisting.push(c)
           record.preExistingFailures = [...preExisting]
           record.baselineNotes = baseline.notes || ''
-          if (preExisting.length) log(`[${spec.id}] already red on ${base} — not this spec's to fix: ${preExisting.join(' | ')}`)
+          if (preExisting.length) log(`[${spec.id}] already red on ${baseRef} — not this spec's to fix: ${preExisting.join(' | ')}`)
         } else {
           log(`[${spec.id}] baseline could not run (${baseline?.notes || 'agent error'}) — treating every failure as ours`)
         }
@@ -492,6 +624,9 @@ In notes, say briefly what each failure actually was, so a human reading the PR 
     if (round === FIX_ROUNDS) break
 
     round++
+    // Later rounds go to a stronger model: if the first fixer couldn't
+    // crack it twice, a third try on the same model rarely does.
+    const fixModel = round >= ESCALATE.fromRound ? ESCALATE.model : model
     const problems = [
       gate.uncheckedTasks.length ? `Unfinished tasks: ${gate.uncheckedTasks.join(', ')}` : '',
       gate.missingCommits.length ? `Checked tasks with NO Spec-Task commit (redo them): ${gate.missingCommits.join(', ')}` : '',
@@ -499,21 +634,21 @@ In notes, say briefly what each failure actually was, so a human reading the PR 
       gate.uncheckedCriteria.length ? `Unmet acceptance criteria: ${gate.uncheckedCriteria.join(' | ')}` : '',
       gate.notes ? `Gate notes: ${gate.notes}` : '',
     ].filter(Boolean).join('\n')
-    log(`[${spec.id}] gate failed (round ${round}/${FIX_ROUNDS}) — dispatching fix agent`)
+    log(`[${spec.id}] gate failed (round ${round}/${FIX_ROUNDS}) — dispatching fix agent${fixModel !== model ? ` on ${fixModel}` : ''}`)
     try {
-      await agent(
+      await ask(
         `Spec ${spec.id} on branch ${branch} failed its completeness gate. The spec file is at ${claim.specPath}. Fix ONLY the reported problems, following ${PROCESS} — one commit per task with its Spec-Task: ${spec.id}.<taskId> trailer (use the trailer of the task each fix belongs to).
-
+${round > 1 ? `\nThis is fix round ${round} of ${FIX_ROUNDS}: earlier rounds did not get the gate to pass. Read \`git log ${baseRef}..HEAD\` to see what they tried, and do not repeat an approach that already failed.\n` : ''}
 ${problems}
 ${preExisting.length ? `
-ALREADY RED ON ${base}, CONFIRMED BY A BASELINE RUN — NOT YOURS TO FIX:
+ALREADY RED ON ${baseRef}, CONFIRMED BY A BASELINE RUN — NOT YOURS TO FIX:
 ${preExisting.map(c => `  - ${c}`).join('\n')}
 Leave them alone. They are deliberately excluded from the list above.
 ` : ''}
-**Scope.** Every commit you make wears a \`Spec-Task: ${spec.id}.*\` trailer, which claims the change belongs to this spec. So it has to. Before you touch a file, ask whether the problem was introduced by this branch — \`git log ${base}..HEAD -- <path>\` and \`git diff --name-only ${base}...HEAD\` answer it. If the cause predates the branch (a red test in a file nobody here touched, a dependency advisory, a stale fixture, a missing service), DO NOT fix it: say so in your final message and move on. That fix belongs in its own branch.
+**Scope.** Every commit you make wears a \`Spec-Task: ${spec.id}.*\` trailer, which claims the change belongs to this spec. So it has to. Before you touch a file, ask whether the problem was introduced by this branch — \`git log ${baseRef}..HEAD -- <path>\` and \`git diff --name-only ${baseRef}...HEAD\` answer it. If the cause predates the branch (a red test in a file nobody here touched, a dependency advisory, a stale fixture, a missing service), DO NOT fix it: say so in your final message and move on. That fix belongs in its own branch.
 
 Re-run the relevant verify commands before committing. Do not touch anything outside the reported problems.`,
-        { phase: 'Gate', label: `fix:${spec.id}:r${round}`, model },
+        { phase: 'Gate', label: `fix:${spec.id}:r${round}`, model: fixModel },
       )
     } catch (e) {
       log(`[${spec.id}] fix round ${round} errored: ${e?.message || e}`)
@@ -524,7 +659,7 @@ Re-run the relevant verify commands before committing. Do not touch anything out
   if (!gate?.complete) {
     log(`[${spec.id}] BLOCKED${taskFailed ? ` (task ${taskFailed})` : ''} — draft PR; ${STACKING === 'chain' ? 'stopping the chain' : 'dependents will skip, unrelated specs continue'}`)
     try {
-      await agent(
+      await ask(
         `Spec ${spec.id} on branch ${branch} is blocked (spec file: ${claim.specPath}). Follow the failure protocol in ${PROCESS} if it has one; otherwise:
 1. Add a "## Blocked" section to the spec file listing: what was attempted, the exact errors, which tasks are unchecked (${(gate?.uncheckedTasks || []).concat(gate?.missingCommits || []).join(', ') || taskFailed || 'see gate notes'}), failing verification (${(gate?.failedVerification || []).join(' | ') || 'none'}), and unmet criteria (${(gate?.uncheckedCriteria || []).join(' | ') || 'none'}). Gate notes: ${gate?.notes || 'n/a'}${record.preExistingFailures?.length ? `\n   Note separately, under a "Not caused by this spec" heading, that these were confirmed already failing on ${base} and were deliberately left alone: ${record.preExistingFailures.join(' | ')}` : ''}
 2. Commit it. Leave the spec in ${S.inProgress}/ — do NOT move it to done.
@@ -546,7 +681,7 @@ Re-run the relevant verify commands before committing. Do not touch anything out
   // and never blocks Complete.
   if (P.capture) {
     try {
-      const capture = await agent(
+      const capture = await ask(
         `Spec ${spec.id} on branch ${branch} has passed its completeness gate (spec file: ${claim.specPath}). Capture visuals of what it changed — advisory, do NOT change any implementation code.
 
 ${fill(P.capture, vars)}
@@ -583,7 +718,7 @@ Report committed=true only if the screenshots commit exists (confirm with git lo
   const labels = PR_LABELS.map(l => ` --label ${l}`).join('')
   let fin
   try {
-    fin = await agent(
+    fin = await ask(
       `Spec ${spec.id} on branch ${branch} passed its completeness gate. Follow ${PROCESS} for completing a spec:
 1. Move the spec to done — the whole spec, exactly as at claim time:
 ${moveSteps(S.inProgress, S.done, spec)}
@@ -620,12 +755,12 @@ Report pushed=true only if step 5 succeeds. Never fabricate success.`,
 
   // Complete and on origin: usable as a base from here on.
   branchById[spec.id] = branch
-  chainBase = branch
+  chain = { base: branch, ref: branch }
 
   // ── Independent review — advisory, never aborts ────────────
   if (RUN_REVIEW && fin.prNumber > 0) {
     try {
-      record.review = await agent(
+      record.review = await ask(
         `Run a code review of PR #${fin.prNumber} and post findings as inline comments. Execute the slash command: /code-review high --comment ${fin.prNumber}
 You have no implementation context on purpose — review independently.${P.afterReview ? `\nOnce the findings are posted:\n${fill(P.afterReview, { ...vars, pr: fin.prNumber })}` : ''}
 Return a one-line note of how many findings you posted.`,
@@ -642,10 +777,12 @@ Return a one-line note of how many findings you posted.`,
 const ok = processed.filter(p => p.pushed).length
 const skipped = processed.filter(p => p.skipped).length
 const blocked = processed.filter(p => p.blocked).length
+const unready = processed.filter(p => p.notReady)
 log(`Finished: ${ok}/${specs.length} spec(s) landed${blocked ? `, ${blocked} blocked` : ''}${skipped ? `, ${skipped} skipped` : ''}.`)
 
-// Surface inherited breakage once, at the end, as a to-do for the repo.
+// Surface what needs a human, once, at the end.
+for (const p of unready) log(`[${p.id}] not built — fix the spec first: ${p.notReady.join(' | ')}`)
 const inherited = [...new Set(processed.flatMap(p => p.preExistingFailures || []))]
 if (inherited.length) log(`Already red before this run, left alone on purpose (worth their own branch): ${inherited.join(' | ')}`)
 
-return { startBase, landed: ok, inherited, processed }
+return { startBase, startRef, worktree: WORKTREE || null, landed: ok, notReady: unready.map(p => ({ id: p.id, problems: p.notReady })), inherited, processed }

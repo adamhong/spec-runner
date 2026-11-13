@@ -54,11 +54,18 @@ const verdict = (over = {}) => ({
 
 const spec = (id, over = {}) => ({id, filename: `${id}-f`, slug: "f", path: "p", model: "", deps: [], ...over})
 
-async function run({gate = () => verdict({complete: true}), baseline = null, capture, config = CONFIG, specs = [spec("0317")], baseBranch = "develop", args = {}} = {}) {
+const READY = {ready: true, problems: [], warnings: []}
+const REVIEW_OK = {ok: true, problems: []}
+
+async function run({
+  gate = () => verdict({complete: true}), baseline = null, capture, config = CONFIG, specs = [spec("0317")],
+  baseBranch = "develop", args = {}, ready = () => READY, taskReview = () => REVIEW_OK,
+} = {}) {
   const logs = []
   const calls = []
   const prompts = {}
   const opts = {}
+  const byLabel = {}
 
   const agent = async (prompt, o = {}) => {
     const label = o.label || ""
@@ -66,24 +73,28 @@ async function run({gate = () => verdict({complete: true}), baseline = null, cap
     const key = label.split(":")[0]
     prompts[key] = prompt
     opts[key] = o
+    byLabel[label] = {prompt, o}
 
+    const id = label.split(":")[1]
     if (key === "plan") return {baseBranch, specs}
+    if (key === "ready") return ready(id)
     if (key === "claim") {
-      const id = label.split(":")[1]
       return {branch: `spec/${id}-f`, specPath: "sp", title: "A title", resumed: false, tasks: [{id: "T1", title: "t", verify: "", done: false}]}
     }
     if (key === "task") return {committed: true, sha: "abcdef1234", summary: ""}
+    if (key === "taskreview") return taskReview(id)
     if (key === "gate") return gate(calls.filter((c) => c.startsWith("gate")).length, label)
     if (key === "baseline") return baseline
     if (key === "capture") return capture || {attempted: false, committed: false, count: 0, galleryPath: "", summary: ""}
     if (key === "complete") return {prNumber: 1, pushed: true, summary: ""}
     return ""
   }
+  const parallel = (thunks) => Promise.all(thunks.map((t) => t().catch(() => null)))
 
   const fn = new Function("args", "agent", "log", "phase", "parallel", "pipeline", `return (async () => { ${BODY} })()`)
-  const result = await fn({config, review: false, ...args}, agent, (m) => logs.push(m), () => {}, () => {}, () => {})
-  const count = (p) => calls.filter((c) => c.startsWith(p)).length
-  return {result, logs, calls, prompts, opts, count}
+  const result = await fn({config, review: false, ...args}, agent, (m) => logs.push(m), () => {}, parallel, () => {})
+  const count = (p) => calls.filter((c) => c.split(":")[0] === p).length
+  return {result, logs, calls, prompts, opts, byLabel, count}
 }
 
 const tests = []
@@ -271,6 +282,107 @@ test("chain stacking: each spec builds on the last, and the first failure stops 
   assert.equal(b.skipped, true)
   assert.equal(c.skipped, true)
   assert.equal(stopped.count("claim"), 1)
+})
+
+// ── Readiness ─────────────────────────────────────────────────
+
+test("an unready spec is not built, its dependents skip, unrelated specs still build", async () => {
+  const o = await run({
+    ready: (id) => (id === "0001" ? {ready: false, problems: ["T3 says TBD"], warnings: []} : READY),
+    specs: [spec("0001"), spec("0002", {deps: ["0001"]}), spec("0003")],
+  })
+  assert.equal(o.count("ready"), 3, "every spec is checked, up front")
+  assert.ok(!o.calls.includes("claim:0001"), "an unready spec is never claimed")
+  const [a, b, c] = o.result.processed
+  assert.deepEqual(a.notReady, ["T3 says TBD"])
+  assert.equal(b.skipped, true)
+  assert.equal(c.pushed, true)
+  assert.deepEqual(o.result.notReady, [{id: "0001", problems: ["T3 says TBD"]}])
+})
+
+test("readiness can be turned off, and a check that errors doesn't hold a spec back", async () => {
+  const off = await run({config: {...CONFIG, readinessCheck: false}})
+  assert.equal(off.count("ready"), 0)
+  const errored = await run({ready: () => { throw new Error("529") }})
+  assert.equal(errored.result.landed, 1)
+})
+
+// ── Per-task review ───────────────────────────────────────────
+
+test("a task review that finds problems gets one fix, as a new commit on the same trailer", async () => {
+  const o = await run({taskReview: () => ({ok: false, problems: ["calls Foo.bar/2, which doesn't exist"]})})
+  assert.equal(o.count("taskreview"), 1)
+  assert.equal(o.count("taskfix"), 1)
+  assert.match(o.prompts.taskfix, /Foo\.bar\/2/)
+  assert.match(o.prompts.taskfix, /do not amend/)
+  assert.match(o.prompts.taskfix, /Spec-Task: 0317\.T1/)
+  assert.match(o.prompts.taskreview, /Do NOT run tests/)
+  assert.equal(o.result.landed, 1, "the gate is still the judge")
+})
+
+test("a clean task review costs no fix; taskReview:false skips reviews", async () => {
+  const clean = await run()
+  assert.equal(clean.count("taskreview"), 1)
+  assert.equal(clean.count("taskfix"), 0)
+  const off = await run({config: {...CONFIG, taskReview: false}})
+  assert.equal(off.count("taskreview"), 0)
+})
+
+// ── Escalating fixes ──────────────────────────────────────────
+
+test("fix rounds default to 4, and escalate to a stronger model from round 3", async () => {
+  const o = await run({gate: () => verdict({uncheckedTasks: ["T1"]})})
+  assert.equal(o.count("fix"), 4)
+  assert.equal(o.byLabel["fix:0317:r1"].o.model, "sonnet")
+  assert.equal(o.byLabel["fix:0317:r2"].o.model, "sonnet")
+  assert.equal(o.byLabel["fix:0317:r3"].o.model, "opus")
+  assert.equal(o.byLabel["fix:0317:r4"].o.model, "opus")
+  assert.match(o.byLabel["fix:0317:r3"].prompt, /do not repeat an approach that already failed/)
+  assert.equal(o.count("blocked"), 1)
+})
+
+test("escalation is configurable", async () => {
+  const o = await run({
+    config: {...CONFIG, fixRounds: 2, fixEscalation: {fromRound: 2, model: "sonnet-max"}},
+    gate: () => verdict({uncheckedTasks: ["T1"]}),
+  })
+  assert.equal(o.byLabel["fix:0317:r1"].o.model, "sonnet")
+  assert.equal(o.byLabel["fix:0317:r2"].o.model, "sonnet-max")
+})
+
+// ── Worktree ──────────────────────────────────────────────────
+
+const WT = {worktree: "/repo/.git/spec-runner/worktree", base: "develop", baseRef: "origin/develop"}
+
+test("worktree: every agent is told where to work, and nothing checks the user's branch", async () => {
+  const o = await run({args: WT, baseBranch: "HEAD"})
+  assert.equal(o.result.landed, 1, "a detached worktree isn't 'the wrong branch'")
+  for (const label of o.calls) assert.match(o.byLabel[label].prompt, /^WORKING DIRECTORY: .*\/repo\/\.git\/spec-runner\/worktree/, label)
+})
+
+test("worktree: branches start from origin/<base>, PRs target <base>", async () => {
+  const o = await run({
+    args: WT, baseBranch: "HEAD",
+    gate: () => verdict({failedVerification: ["make lint"]}),
+    baseline: {ran: true, alreadyFailing: ["make lint"], newlyFailing: [], notes: ""},
+  })
+  assert.match(o.prompts.claim, /git checkout -b spec\/0317-f origin\/develop/)
+  assert.doesNotMatch(o.prompts.claim, /git checkout develop/, "can't check out a branch the main checkout holds")
+  assert.match(o.prompts.baseline, /git checkout --detach origin\/develop/)
+  assert.match(o.prompts.complete, /gh pr create --base develop /)
+  assert.match(o.prompts.complete, /already failing on develop/)
+})
+
+test("worktree: a dependent spec stacks on its parent's local branch", async () => {
+  const o = await run({args: WT, baseBranch: "HEAD", specs: [spec("0001"), spec("0002", {deps: ["0001"]})]})
+  assert.match(o.byLabel["claim:0002"].prompt, /git checkout -b spec\/0002-f spec\/0001-f/)
+  assert.equal(o.result.processed[1].base, "spec/0001-f")
+})
+
+test("in place: no working-directory note", async () => {
+  const o = await run()
+  assert.doesNotMatch(o.prompts.claim, /WORKING DIRECTORY/)
+  assert.match(o.prompts.claim, /git checkout -b spec\/0317-f develop/)
 })
 
 let failed = 0

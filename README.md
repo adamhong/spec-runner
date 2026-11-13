@@ -3,24 +3,31 @@
 A Claude Code plugin that takes a folder of written specs and turns each one into a pull request,
 without you in the loop for each step.
 
-For every spec in your `ready` folder it:
+First it **checks every spec is buildable**: a read-only pass looks for requirements an agent
+would have to guess at, contradictions, and specs with no way to verify them. Specs that fail
+are left out, with the problems listed, so the author can fix them and rerun. Then, for each
+spec that's ready, it:
 
 1. **Claims** it: creates a branch, moves the spec to `in-progress`, and breaks it into
    commit-sized tasks if it doesn't have them yet.
 2. **Builds** it one task at a time, each with a fresh agent. Each task makes one commit with a
    `Spec-Task: <spec>.<task>` trailer and ticks its box in the spec. Task agents only check that
-   their code compiles; tests run once, at the gate.
+   their code compiles; tests run once, at the gate. A reviewer then reads that one commit
+   against its task and gets one fix if something's off, so a wrong turn is caught where it
+   happened instead of at the end.
 3. **Gates** it with an independent agent that wrote none of the code. The gate checks that every
    task has its commit, runs the spec's verification, and walks the acceptance criteria. If
-   something fails, a fix agent gets a bounded number of rounds.
+   something fails, a fix agent gets up to four rounds; the later rounds move to a stronger
+   model.
 4. **Checks failures against the base branch.** If a failing command fails on the base branch too,
    it isn't this spec's problem. The spec still lands, and the PR says what was already broken,
    instead of quietly "fixing" unrelated code under the spec's name.
 5. **Opens the PR** (or a draft PR marked `[BLOCKED]` with a write-up if the gate never passes),
    then runs an independent `/code-review` on it.
 
-Specs run one after another in the same checkout. Progress lives in git and in the spec's
-checkboxes, so an interrupted run picks up where it stopped.
+The run builds in **its own git worktree**, starting from `origin/<base>`, so you can keep
+working in your checkout while it runs. Specs run one after another. Progress lives in git and
+in the spec's checkboxes, so an interrupted run picks up where it stopped.
 
 ## Install
 
@@ -43,14 +50,27 @@ To have it offered automatically to everyone who works in a repo, add this to th
 
 ## Use
 
-From the base branch, with a clean working tree:
+From anywhere in the repo, on any branch:
 
 ```
-/spec-runner:run-specs                 # every spec in the ready folder
-/spec-runner:run-specs 0230 0231       # just these
-/spec-runner:run-specs --no-review     # skip the code-review pass
-/spec-runner:run-specs --max 2         # at most two specs this run
+/spec-runner:run-specs                   # every spec in the ready folder
+/spec-runner:run-specs 0230 0231         # just these
+/spec-runner:run-specs --no-review       # skip the code-review pass
+/spec-runner:run-specs --skip-readiness  # build specs even if the readiness check would hold them
+/spec-runner:run-specs --max 2           # at most two specs this run
+/spec-runner:run-specs --here            # build in this checkout instead of a worktree
 ```
+
+**The worktree.** The run builds at `.git/spec-runner/worktree`, inside your repo's `.git`
+folder, so it never shows up as untracked files. It starts from `origin/<base>`, which means
+**specs must be pushed** to be picked up; the command warns you if your local base is ahead.
+A fresh worktree has no installed dependencies and none of your gitignored files, so tell the
+runner what to copy in and what to run (`worktree.copy`, `worktree.setup` below). The worktree
+is kept between runs, dependencies and all, so only the first run pays for setup.
+`git worktree remove .git/spec-runner/worktree` deletes it.
+
+`--here` builds in your current checkout instead: it must be on the base branch with a clean
+tree, and you can't use the checkout while the run goes.
 
 ## Setting up a repo
 
@@ -85,14 +105,22 @@ what your repo does differently from the defaults.
   "gateSetup": "",
   "prBody": "",
   "review": true,
-  "fixRounds": 2,
+  "readinessCheck": true,
+  "taskReview": true,
+  "fixRounds": 4,
+  "fixEscalation": { "fromRound": 3, "model": "opus" },
+  "worktree": {
+    "enabled": true,
+    "copy": [".env"],
+    "setup": ["pnpm install --frozen-lockfile"]
+  },
   "prompts": {}
 }
 ```
 
 | Key | What it does |
 |---|---|
-| `baseBranch` | The run refuses to start anywhere else. Unset: whatever branch you're on. |
+| `baseBranch` | The branch PRs target and new branches start from. Unset: whatever branch you're on. With `--here`, the run refuses to start on any other branch. |
 | `processDoc` | Your written process. Every agent is told to follow it, so repo-specific rules for claiming, committing and completing a spec belong here. |
 | `template` | Where the spec template (and its Tasks format) lives. |
 | `specs.ready` / `inProgress` / `done` | The lifecycle folders. Specs move between them with `git mv`. |
@@ -115,7 +143,13 @@ what your repo does differently from the defaults.
 | `gateSetup` | Anything the gate must do first, e.g. "start the database with `docker compose up -d` if verification needs it". |
 | `prBody` | Extra instructions for the PR description. |
 | `review` | Run `/code-review high --comment` on each PR. |
+| `readinessCheck` | Check each spec is buildable before claiming any. `false` to skip. |
+| `taskReview` | Review each task's commit against its task, with one fix if needed. `false` to skip, if per-task time matters more than catching problems early. |
 | `fixRounds` | Fix attempts after a failed gate, before the spec is marked blocked. |
+| `fixEscalation` | From which fix round to switch models, and to which. |
+| `worktree.enabled` | `false` to always build in place, as if `--here` were given. |
+| `worktree.copy` | Gitignored files to copy from your checkout into the worktree before each run, e.g. `.env` files. |
+| `worktree.setup` | Commands to run in the worktree before each run, e.g. installing dependencies or generating a database client. Each may `cd` into a subdirectory. |
 | `prompts` | Repo-specific steps, each a path to a Markdown file (below). |
 
 ### Repo-specific steps
