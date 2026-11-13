@@ -25,6 +25,11 @@ spec that's ready, it:
 5. **Opens the PR** (or a draft PR marked `[BLOCKED]` with a write-up if the gate never passes),
    then runs an independent `/code-review` on it.
 
+Specs that already have an **open PR** are left alone, and so are the specs that depend on
+them: until that PR merges, the base branch still lists the spec as ready, and rebuilding it
+would only redo finished work. A spec parked as a draft `[BLOCKED]` PR is retried when you
+name its id (`/spec-runner:run-specs 0230`).
+
 The run builds in **its own git worktree**, starting from `origin/<base>`, so you can keep
 working in your checkout while it runs. Specs run one after another. Progress lives in git and
 in the spec's checkboxes, so an interrupted run picks up where it stopped.

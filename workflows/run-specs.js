@@ -126,8 +126,10 @@ const PLAN_SCHEMA = {
           path: { type: 'string', description: 'path to the spec markdown' },
           model: { type: 'string', description: 'raw model value from the spec, or empty string' },
           deps: { type: 'array', items: { type: 'string' }, description: 'ids of specs that must be done first; empty if none' },
+          openPr: { type: 'integer', description: 'number of an OPEN pull request for this spec, or 0 if none' },
+          openPrDraft: { type: 'boolean', description: 'true if that open PR is a draft (false when openPr is 0)' },
         },
-        required: ['id', 'filename', 'slug', 'path', 'model', 'deps'],
+        required: ['id', 'filename', 'slug', 'path', 'model', 'deps', 'openPr', 'openPrDraft'],
       },
     },
   },
@@ -146,6 +148,7 @@ const plan = await ask(
 4. For each spec, read ${MODEL.from || 'the first frontmatter line matching ^>\\s*\\*\\*Model\\*\\*:'} and return its value (strip backticks/whitespace), or an empty string if absent.
 5. For each spec, read ${DEPS_FROM}. Put the id of every SPEC it lists as a prerequisite into \`deps\`. Ignore external services and packages — only spec ids count. Empty array if none.
 6. Derive a slug from each spec's title.
+7. Find specs that already have an open pull request. Run once: \`gh pr list --state open --limit 200 --json number,headRefName,title,isDraft\`. A PR belongs to a spec if its head branch or its title contains the spec's id as a whole token (e.g. "0230" in "spec/0230-foo" or "spec/0230: Foo", but not in "10230"). Report its number in openPr and its isDraft in openPrDraft; 0 and false if none. If gh itself fails, report 0/false for every spec.
 Return the structured result.`,
   { phase: 'Plan', label: 'plan:discover', schema: PLAN_SCHEMA },
 )
@@ -172,6 +175,29 @@ if (specs.length === 0) {
 
 log(`Planning ${specs.length} spec(s) off ${startRef}${WORKTREE ? ` in worktree ${WORKTREE}` : ''} (${STACKING} stacking): ${specs.map(s => s.id).join(', ')}`)
 
+// ── Specs that already have an open PR ───────────────────────
+// Status lives in folders, and folders move on branches: until a spec's PR
+// merges, the base still lists it under ready/. Without this check a second
+// run would "resume" it — re-gating finished work and failing to open a PR
+// that already exists. An open PR in review is always left alone; changes
+// go through that PR. A draft is how a blocked spec is parked, so naming its
+// id explicitly is the way to retry it.
+const digits = s => String(s).replace(/\D/g, '').replace(/^0+/, '')
+const sameId = (a, b) => a === b || (digits(a) !== '' && digits(a) === digits(b))
+const asked = spec => !!ID_FILTER && ID_FILTER.some(x => sameId(String(x), spec.id))
+const held = {} // spec id → reason
+for (const spec of specs) {
+  if (!spec.openPr) continue
+  if (spec.openPrDraft && asked(spec)) {
+    log(`[${spec.id}] draft PR #${spec.openPr} is open — retrying it, since you asked for this spec by id`)
+    continue
+  }
+  held[spec.id] = spec.openPrDraft
+    ? `draft PR #${spec.openPr} is open (blocked earlier) — name ${spec.id} explicitly to retry it, or close the PR`
+    : `PR #${spec.openPr} is already open — merge or close it first`
+  log(`[${spec.id}] skipped — ${held[spec.id]}`)
+}
+
 // ── Phase 2: Ready — is each spec buildable as written? ──────
 // A thin or contradictory spec is the most expensive failure there is: it
 // spends every task and a gate before anyone finds out. These checks are
@@ -189,9 +215,10 @@ const READY_SCHEMA = {
 }
 
 const notReady = {} // spec id → problems
-if (RUN_READINESS) {
+const toCheck = specs.filter(s => !held[s.id])
+if (RUN_READINESS && toCheck.length) {
   phase('Ready')
-  const verdicts = await parallel(specs.map(spec => () => ask(
+  const verdicts = await parallel(toCheck.map(spec => () => ask(
     `Check whether spec ${spec.id} (${spec.path}) is ready to be built by agents with no one to ask. Read it, ${TEMPLATE}, and ${PROCESS}. Do NOT modify anything — read only.
 
 It is NOT ready (ready=false) only if one of these holds — list each as a problem, concrete enough to fix in one edit:
@@ -203,7 +230,7 @@ It is NOT ready (ready=false) only if one of these holds — list each as a prob
 Anything else — style, wording, a missing nice-to-have, a criterion that needs a manual check — is a warning, not a problem. Do not hold a spec back for polish.`,
     { phase: 'Ready', label: `ready:${spec.id}`, schema: READY_SCHEMA },
   )))
-  specs.forEach((spec, idx) => {
+  toCheck.forEach((spec, idx) => {
     const v = verdicts[idx]
     if (!v) {
       log(`[${spec.id}] readiness check errored — building it anyway; the gate still applies`)
@@ -357,6 +384,15 @@ for (let i = 0; i < specs.length; i++) {
   processed.push(record)
   const stop = () => { if (STACKING === 'chain') chainBroken = true }
 
+  // Held and unready specs never set branchById, so their dependents skip
+  // too — a dependent must not branch from the base without its parent.
+  if (held[spec.id]) {
+    record.skipped = true
+    record.openPr = spec.openPr
+    record.skipReason = held[spec.id]
+    stop()
+    continue
+  }
   if (notReady[spec.id]) {
     record.skipped = true
     record.notReady = notReady[spec.id]
@@ -781,8 +817,10 @@ const unready = processed.filter(p => p.notReady)
 log(`Finished: ${ok}/${specs.length} spec(s) landed${blocked ? `, ${blocked} blocked` : ''}${skipped ? `, ${skipped} skipped` : ''}.`)
 
 // Surface what needs a human, once, at the end.
+const alreadyOpen = processed.filter(p => p.openPr).map(p => ({ id: p.id, pr: p.openPr, reason: p.skipReason }))
+for (const p of alreadyOpen) log(`[${p.id}] not touched — ${p.reason}`)
 for (const p of unready) log(`[${p.id}] not built — fix the spec first: ${p.notReady.join(' | ')}`)
 const inherited = [...new Set(processed.flatMap(p => p.preExistingFailures || []))]
 if (inherited.length) log(`Already red before this run, left alone on purpose (worth their own branch): ${inherited.join(' | ')}`)
 
-return { startBase, startRef, worktree: WORKTREE || null, landed: ok, notReady: unready.map(p => ({ id: p.id, problems: p.notReady })), inherited, processed }
+return { startBase, startRef, worktree: WORKTREE || null, landed: ok, alreadyOpen, notReady: unready.map(p => ({ id: p.id, problems: p.notReady })), inherited, processed }

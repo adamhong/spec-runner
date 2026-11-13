@@ -82,6 +82,8 @@ Pass `args` as a JSON object, not a string. Leave out any option that doesn't ap
 When the workflow finishes, give a short table: each spec, its outcome (landed with PR
 number, blocked, not ready, skipped and why), and the base it targeted. Then:
 
+- For each spec under `alreadyOpen`: its PR and why it was left alone. A draft PR is a
+  blocked spec; naming its id reruns it.
 - For each spec under `notReady`: its problems, so the author can fix the spec and rerun.
 - Anything under `inherited`: verification commands already failing on the base branch and
   left alone. Those are worth their own fixes.

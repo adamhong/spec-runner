@@ -307,6 +307,42 @@ test("readiness can be turned off, and a check that errors doesn't hold a spec b
   assert.equal(errored.result.landed, 1)
 })
 
+// ── Specs that already have an open PR ────────────────────────
+
+test("a spec with an open PR is left alone: not checked, not claimed, and its dependents skip", async () => {
+  const o = await run({specs: [spec("0001", {openPr: 812, openPrDraft: false}), spec("0002", {deps: ["0001"]}), spec("0003")]})
+  assert.ok(!o.calls.includes("ready:0001"), "no readiness check spent on it")
+  assert.ok(!o.calls.includes("claim:0001"))
+  const [a, b, c] = o.result.processed
+  assert.equal(a.skipped, true)
+  assert.match(a.skipReason, /PR #812 is already open/)
+  assert.equal(b.skipped, true, "a dependent must not branch from base without its parent")
+  assert.equal(c.pushed, true)
+  assert.deepEqual(o.result.alreadyOpen.map((p) => [p.id, p.pr]), [["0001", 812]])
+})
+
+test("a draft (blocked) PR is skipped by default, and retried when its id is named", async () => {
+  const blocked = spec("0001", {openPr: 9, openPrDraft: true})
+  const dflt = await run({specs: [blocked]})
+  assert.match(dflt.result.processed[0].skipReason, /draft PR #9 .* name 0001 explicitly to retry/)
+  assert.equal(dflt.count("claim"), 0)
+
+  const named = await run({specs: [blocked], args: {ids: ["1"]}})
+  assert.equal(named.count("claim"), 1, "\"1\" matches 0001 loosely")
+  assert.equal(named.result.landed, 1)
+})
+
+test("naming a spec whose PR is in review doesn't override the hold", async () => {
+  const o = await run({specs: [spec("0001", {openPr: 812, openPrDraft: false})], args: {ids: ["0001"]}})
+  assert.equal(o.count("claim"), 0)
+})
+
+test("chain stacking: an open PR stops the chain like any spec that didn't land here", async () => {
+  const o = await run({config: {...CONFIG, stacking: "chain"}, specs: [spec("0001", {openPr: 5, openPrDraft: false}), spec("0002")]})
+  assert.equal(o.count("claim"), 0)
+  assert.equal(o.result.processed[1].skipped, true)
+})
+
 // ── Per-task review ───────────────────────────────────────────
 
 test("a task review that finds problems gets one fix, as a new commit on the same trailer", async () => {
