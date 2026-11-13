@@ -1,0 +1,4 @@
+node_modules/
+.DS_Store
+# Per-repo config drafts. They name private projects; never publish them.
+drafts/

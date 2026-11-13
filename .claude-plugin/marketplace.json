@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "spec-runner",
+  "description": "Spec-to-PR runner for Claude Code",
+  "owner": { "name": "Adam Hong" },
+  "plugins": [
+    {
+      "name": "spec-runner",
+      "description": "Run a queue of written specs to PRs with per-task agents and an independent completeness gate.",
+      "source": "./",
+      "category": "development"
+    }
+  ]
+}
